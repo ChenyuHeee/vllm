@@ -204,6 +204,30 @@ class DefaultModelLoader(BaseModelLoader):
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        # ── IPC path: load weights from peer GPU via reduce_tensor handles ──
+        import os as _os
+        _ipc_registry = _os.environ.get("VLLM_IPC_REGISTRY", "")
+        if _ipc_registry and _os.path.exists(_ipc_registry):
+            import pickle as _pickle
+            logger.info("IPC mode: loading weights from peer GPU (registry: %s)", _ipc_registry)
+            with open(_ipc_registry, "rb") as _f:
+                _payload = _pickle.load(_f)
+            _ipc_data = _payload["ipc_data"]
+            logger.info("IPC: %d tensors, %.1f GB", len(_ipc_data), _payload["total_gb"])
+            _t0 = time.perf_counter()
+            def _ipc_iter():
+                for _h in _ipc_data:
+                    _func, _args = _h["handle"]
+                    _args_list = list(_args)
+                    _args_list[6] = 0  # target device = cuda:0
+                    _tensor = _func(*_args_list)
+                    yield _h["name"], _tensor
+            if self.counter_before_loading_weights == 0.0:
+                self.counter_before_loading_weights = _t0
+            logger.info("IPC: yielding %d tensors via IPC iterator", len(_ipc_data))
+            return _ipc_iter()
+        # ── end IPC path ──
+
         extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
