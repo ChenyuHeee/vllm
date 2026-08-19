@@ -35,6 +35,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.tracing import instrument
+import pickle as _pickle
+import os as _os
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
@@ -204,29 +206,6 @@ class DefaultModelLoader(BaseModelLoader):
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
-        # ── IPC path: load weights from peer GPU via reduce_tensor handles ──
-        import os as _os
-        _ipc_registry = _os.environ.get("VLLM_IPC_REGISTRY", "")
-        if _ipc_registry and _os.path.exists(_ipc_registry):
-            import pickle as _pickle
-            logger.info("IPC mode: loading weights from peer GPU (registry: %s)", _ipc_registry)
-            with open(_ipc_registry, "rb") as _f:
-                _payload = _pickle.load(_f)
-            _ipc_data = _payload["ipc_data"]
-            logger.info("IPC: %d tensors, %.1f GB", len(_ipc_data), _payload["total_gb"])
-            _t0 = time.perf_counter()
-            def _ipc_iter():
-                for _h in _ipc_data:
-                    _func, _args = _h["handle"]
-                    _args_list = list(_args)
-                    _args_list[6] = 0  # target device = cuda:0
-                    _tensor = _func(*_args_list)
-                    yield _h["name"], _tensor
-            if self.counter_before_loading_weights == 0.0:
-                self.counter_before_loading_weights = _t0
-            logger.info("IPC: yielding %d tensors via IPC iterator", len(_ipc_data))
-            return _ipc_iter()
-        # ── end IPC path ──
 
         extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -390,6 +369,29 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        # ── IPC direct import path ──
+        _ipc_import_file = _os.environ.get("VLLM_IPC_REGISTRY", "")
+        if _ipc_import_file and _os.path.exists(_ipc_import_file):
+            logger.info("IPC import: loading weights from peer GPU (registry: %s)", _ipc_import_file)
+            with open(_ipc_import_file, "rb") as _f:
+                _handles = _pickle.load(_f)
+            _t0 = time.perf_counter()
+            for _name, _param in model.named_parameters():
+                if _name in _handles:
+                    _func, _args = _handles[_name]
+                    _args_list = list(_args)
+                    _args_list[6] = 0
+                    _tensor = _func(*_args_list)
+                    _param.data.copy_(_tensor)
+            torch.cuda.synchronize()
+            _elapsed = time.perf_counter() - _t0
+            _total_gb = sum(p.numel() * p.element_size() for _, p in model.named_parameters()) / 1e9
+            logger.info("IPC import: %.1f GB in %.2f seconds (%.1f GB/s)", _total_gb, _elapsed, _total_gb / _elapsed)
+            self.counter_before_loading_weights = _t0
+            self.counter_after_loading_weights = _t0 + _elapsed
+            logger.info("IPC import: Loading weights took %.2f seconds", _elapsed)
+            return
+
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (
@@ -418,3 +420,20 @@ class DefaultModelLoader(BaseModelLoader):
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
+
+        # ── IPC export (rank 0 only) ──
+        _ipc_export_file = _os.environ.get("VLLM_IPC_EXPORT", "")
+        if _ipc_export_file:
+            _tp_rank = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+            if _tp_rank == 0 or _os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] == _os.environ.get("VLLM_IPC_EXPORT_RANK0_DEVICE", "0"):
+                from torch.multiprocessing.reductions import reduce_tensor
+                logger.info("IPC export: exporting handles to %s", _ipc_export_file)
+                _t0 = time.perf_counter()
+                _handles = {}
+                for _name, _param in model.named_parameters():
+                    _handles[_name] = reduce_tensor(_param.data)
+                torch.cuda.synchronize()
+                with open(_ipc_export_file, "wb") as _f:
+                    _pickle.dump(_handles, _f)
+                _elapsed = time.perf_counter() - _t0
+                logger.info("IPC export: %d parameters in %.2f seconds", len(_handles), _elapsed)
