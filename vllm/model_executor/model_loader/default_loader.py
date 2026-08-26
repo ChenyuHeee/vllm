@@ -9,6 +9,9 @@ from typing import cast
 
 import torch
 from torch import nn
+import threading as _threading
+import re as _re
+import json as _json
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from vllm.config import ModelConfig
@@ -40,6 +43,40 @@ import os as _os
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _exp42_emit(phase: str, **kw):
+    """结构化打点：launcher 通过 grep 'EXP42_JSON' 提取。"""
+    logger.info("EXP42_JSON %s", _json.dumps({"phase": phase, **kw}))
+
+
+def _layer_idx(name: str) -> int:
+    """参数名 -> 层号：embed=-1，*layers.N*=N，其余（norm/lm_head/vision/mtp）= 10**9。
+    用 search 而非锚定 match：原始 checkpoint key 是 model.language_model.layers.N.*，
+    vLLM 融合后是 model.language_model.model.layers.N.*，两种命名空间层号都在
+    .layers.N. 里。mtp/vision 明确排除（mtp.layers.0.* 会被误判为第 0 层）。"""
+    if ".mtp." in name or name.startswith("mtp.") or "visual" in name or "vision" in name:
+        return 10**9
+    m = _re.search(r"\.layers\.(\d+)\.", name)
+    if m:
+        return int(m.group(1))
+    if "embed_tokens" in name:
+        return -1
+    return 10**9
+
+
+def _pin_stage(it):
+    """逐 tensor pinned staging（v1 串行版）：
+    pageable(mmappage cache) -> pinned 缓冲 -> GPU，消除 driver 内部 staging。
+    注意：v1 中 CPU memcpy 与 GPU DMA 串行，有效带宽 ~9 GB/s 量级而非
+    纯 DMA 的 22；v2 升级为 per-file 双缓冲流水线后逼近 22。"""
+    for name, tensor in it:
+        if tensor is not None and tensor.device.type == "cpu":
+            pinned = torch.empty_like(tensor, pin_memory=True)
+            pinned.copy_(tensor)
+            yield name, pinned
+        else:
+            yield name, tensor
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -392,6 +429,90 @@ class DefaultModelLoader(BaseModelLoader):
             logger.info("IPC import: Loading weights took %.2f seconds", _elapsed)
             return
 
+
+        # ── Hybrid path: 前 VLLM_HYBRID_LAYERS 层(+embed) IPC + 其余层磁盘并发 ──
+        _hybrid_layers = _os.environ.get("VLLM_HYBRID_LAYERS", "")
+        if _ipc_import_file and _os.path.exists(_ipc_import_file) and _hybrid_layers:
+            _k = int(_hybrid_layers)
+            _params = [(n, p) for n, p in model.named_parameters()]
+            _ipc_params = [(n, p) for n, p in _params
+                           if (_layer_idx(n) == -1 or 0 <= _layer_idx(n) < _k)]
+            logger.info("Hybrid import: layers<%d via IPC (%.1f GB), rest via disk",
+                        _k,
+                        sum(p.numel() * p.element_size() for _, p in _ipc_params) / 1e9)
+
+            self._init_ep_weight_filter(model_config)
+            _ipc_elapsed = {"v": None}
+            _disk_elapsed = {"v": None}
+            _disk_loaded = {"v": None}
+            _t0 = time.perf_counter()
+
+            def _disk_branch():
+                # 注意：get_all_weights() 吐出的是原始 checkpoint key（融合前，
+                # 如 q_proj/k_proj/v_proj），而 model.named_parameters() 里注册的是
+                # 融合后参数名（如 qkv_proj）——两者名字空间不同，不能直接拿融合后
+                # 参数名集合去过滤原始 key（会把所有融合层的原始 key 全部错误剔除，
+                # 静默漏加载）。这里改成对原始 key 直接判层号，层前缀在融合前后
+                # 都保留，判断结果一致。
+                _iter = self.get_all_weights(model_config, model)
+                _iter = ((n, t) for n, t in _iter
+                         if not (_layer_idx(n) == -1 or 0 <= _layer_idx(n) < _k))
+                if _os.environ.get("VLLM_PIN_LOAD", ""):
+                    _iter = _pin_stage(_iter)
+                _stream = torch.cuda.Stream()
+                with torch.cuda.stream(_stream):
+                    _disk_loaded["v"] = model.load_weights(_iter)
+                torch.cuda.synchronize()
+                _disk_elapsed["v"] = time.perf_counter() - _t0
+
+            _thread = _threading.Thread(target=_disk_branch, daemon=True)
+            _thread.start()
+
+            _ipc_loaded = set()
+            _ipc_missing = []
+            _stream_ipc = torch.cuda.Stream()
+            with torch.cuda.stream(_stream_ipc):
+                with open(_ipc_import_file, "rb") as _f:
+                    _handles = _pickle.load(_f)
+                for _name, _param in _ipc_params:
+                    if _name in _handles:
+                        _func, _args = _handles[_name]
+                        _args_list = list(_args)
+                        _args_list[6] = 0
+                        _param.data.copy_(_func(*_args_list))
+                        _ipc_loaded.add(_name)
+                    else:
+                        _ipc_missing.append(_name)
+                torch.cuda.synchronize()
+            _ipc_elapsed["v"] = time.perf_counter() - _t0
+
+            _thread.join()
+            _elapsed = time.perf_counter() - _t0
+            self.counter_before_loading_weights = _t0
+            self.counter_after_loading_weights = _t0 + _elapsed
+
+            # 严格校验：IPC + 磁盘两个分支合起来必须覆盖全部参数，否则不能算
+            # 加载成功——不依赖事后跑生成对比才发现（那是最后一道防线，不是第一道）。
+            _weights_to_load = {n for n, _ in _params}
+            _loaded_union = _ipc_loaded | (_disk_loaded["v"] or set())
+            _missing = _weights_to_load - _loaded_union
+            if _ipc_missing or _missing:
+                raise ValueError(
+                    f"Hybrid import incomplete: {len(_ipc_missing)} params missing "
+                    f"from IPC handles, {len(_missing)} params not loaded by either "
+                    f"branch: {sorted(_missing)[:10]}..."
+                )
+
+            _total_gb = sum(p.numel() * p.element_size() for _, p in _params) / 1e9
+            _exp42_emit("weight_load", mode="hybrid",
+                        ipc_s=round(_ipc_elapsed["v"], 4),
+                        disk_s=round(_disk_elapsed["v"], 4),
+                        total_s=round(_elapsed, 4),
+                        total_gb=round(_total_gb, 3))
+            logger.info("Hybrid import: total %.2f s (ipc %.2f s / disk %.2f s)",
+                        _elapsed, _ipc_elapsed["v"], _disk_elapsed["v"])
+            return
+
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
             if (
@@ -404,9 +525,16 @@ class DefaultModelLoader(BaseModelLoader):
         self._init_ep_weight_filter(model_config)
 
         weights_to_load = {name for name, _ in model.named_parameters()}
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        _weights_iter = self.get_all_weights(model_config, model)
+        if _os.environ.get("VLLM_PIN_LOAD", ""):
+            _weights_iter = _pin_stage(_weights_iter)
+        loaded_weights = model.load_weights(_weights_iter)
 
         self.counter_after_loading_weights = time.perf_counter()
+        _exp42_emit("weight_load", mode="disk",
+                    total_s=round(self.counter_after_loading_weights
+                                  - self.counter_before_loading_weights, 4),
+                    pin=int(bool(_os.environ.get("VLLM_PIN_LOAD", ""))))
         logger.info_once(
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
