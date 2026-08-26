@@ -427,6 +427,24 @@ class DefaultModelLoader(BaseModelLoader):
             _disk_loaded = {"v": None}
             _t0 = time.perf_counter()
 
+            # 预解析全部 IPC handle（打开 mapped tensor）后再启动磁盘线程——
+            # batch2 实测「边开 handle 边拷」时快分支被拖到 ~15 GB/s（与磁盘线程
+            # 的 GIL/driver 调用竞争）；预解析后 copy 循环为纯 GPU-paced 异步发射
+            with open(_ipc_import_file, "rb") as _f:
+                _handles = _pickle.load(_f)
+            _ipc_loaded = set()
+            _ipc_missing = []
+            _mapped = []
+            for _name, _param in _ipc_params:
+                if _name in _handles:
+                    _func, _args = _handles[_name]
+                    _args_list = list(_args)
+                    _args_list[6] = 0
+                    _mapped.append((_name, _param, _func(*_args_list)))
+                    _ipc_loaded.add(_name)
+                else:
+                    _ipc_missing.append(_name)
+
             def _disk_branch():
                 # 注意：get_all_weights() 吐出的是原始 checkpoint key（融合前，
                 # 如 q_proj/k_proj/v_proj），而 model.named_parameters() 里注册的是
@@ -448,21 +466,10 @@ class DefaultModelLoader(BaseModelLoader):
             _thread = _threading.Thread(target=_disk_branch, daemon=True)
             _thread.start()
 
-            _ipc_loaded = set()
-            _ipc_missing = []
             _stream_ipc = torch.cuda.Stream()
             with torch.cuda.stream(_stream_ipc):
-                with open(_ipc_import_file, "rb") as _f:
-                    _handles = _pickle.load(_f)
-                for _name, _param in _ipc_params:
-                    if _name in _handles:
-                        _func, _args = _handles[_name]
-                        _args_list = list(_args)
-                        _args_list[6] = 0
-                        _param.data.copy_(_func(*_args_list))
-                        _ipc_loaded.add(_name)
-                    else:
-                        _ipc_missing.append(_name)
+                for _name, _param, _tensor in _mapped:
+                    _param.data.copy_(_tensor)
                 torch.cuda.synchronize()
             _ipc_elapsed["v"] = time.perf_counter() - _t0
 
