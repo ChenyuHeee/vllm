@@ -506,13 +506,15 @@ class DefaultModelLoader(BaseModelLoader):
             with open(_ipc_import_file, "rb") as _f:
                 _handles = _pickle.load(_f)
             _t0 = time.perf_counter()
+            _ipc_tensors = []
             for _name, _param in model.named_parameters():
                 if _name in _handles:
                     _func, _args = _handles[_name]
                     _args_list = list(_args)
                     _args_list[6] = 0
-                    _tensor = _func(*_args_list)
-                    _param.data.copy_(_tensor)
+                    _ipc_tensors.append((_param, _func(*_args_list)))
+            for _param, _tensor in _ipc_tensors:
+                _param.data.copy_(_tensor)
             torch.cuda.synchronize()
             _elapsed = time.perf_counter() - _t0
             _total_gb = sum(p.numel() * p.element_size() for _, p in model.named_parameters()) / 1e9
