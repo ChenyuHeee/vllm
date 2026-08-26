@@ -406,31 +406,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @instrument(span_name="Load weights")
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        # ── IPC direct import path ──
-        _ipc_import_file = _os.environ.get("VLLM_IPC_REGISTRY", "")
-        if _ipc_import_file and _os.path.exists(_ipc_import_file):
-            logger.info("IPC import: loading weights from peer GPU (registry: %s)", _ipc_import_file)
-            with open(_ipc_import_file, "rb") as _f:
-                _handles = _pickle.load(_f)
-            _t0 = time.perf_counter()
-            for _name, _param in model.named_parameters():
-                if _name in _handles:
-                    _func, _args = _handles[_name]
-                    _args_list = list(_args)
-                    _args_list[6] = 0
-                    _tensor = _func(*_args_list)
-                    _param.data.copy_(_tensor)
-            torch.cuda.synchronize()
-            _elapsed = time.perf_counter() - _t0
-            _total_gb = sum(p.numel() * p.element_size() for _, p in model.named_parameters()) / 1e9
-            logger.info("IPC import: %.1f GB in %.2f seconds (%.1f GB/s)", _total_gb, _elapsed, _total_gb / _elapsed)
-            self.counter_before_loading_weights = _t0
-            self.counter_after_loading_weights = _t0 + _elapsed
-            logger.info("IPC import: Loading weights took %.2f seconds", _elapsed)
-            return
 
 
         # ── Hybrid path: 前 VLLM_HYBRID_LAYERS 层(+embed) IPC + 其余层磁盘并发 ──
+        # （必须在纯 IPC 分支之前判断，否则 IPC 先 return、hybrid 不可达）
+        _ipc_import_file = _os.environ.get("VLLM_IPC_REGISTRY", "")
         _hybrid_layers = _os.environ.get("VLLM_HYBRID_LAYERS", "")
         if _ipc_import_file and _os.path.exists(_ipc_import_file) and _hybrid_layers:
             _k = int(_hybrid_layers)
@@ -511,6 +491,30 @@ class DefaultModelLoader(BaseModelLoader):
                         total_gb=round(_total_gb, 3))
             logger.info("Hybrid import: total %.2f s (ipc %.2f s / disk %.2f s)",
                         _elapsed, _ipc_elapsed["v"], _disk_elapsed["v"])
+            return
+        # ── IPC direct import path ──
+        _ipc_import_file = _os.environ.get("VLLM_IPC_REGISTRY", "")
+        if _ipc_import_file and _os.path.exists(_ipc_import_file):
+            logger.info("IPC import: loading weights from peer GPU (registry: %s)", _ipc_import_file)
+            with open(_ipc_import_file, "rb") as _f:
+                _handles = _pickle.load(_f)
+            _t0 = time.perf_counter()
+            for _name, _param in model.named_parameters():
+                if _name in _handles:
+                    _func, _args = _handles[_name]
+                    _args_list = list(_args)
+                    _args_list[6] = 0
+                    _tensor = _func(*_args_list)
+                    _param.data.copy_(_tensor)
+            torch.cuda.synchronize()
+            _elapsed = time.perf_counter() - _t0
+            _total_gb = sum(p.numel() * p.element_size() for _, p in model.named_parameters()) / 1e9
+            logger.info("IPC import: %.1f GB in %.2f seconds (%.1f GB/s)", _total_gb, _elapsed, _total_gb / _elapsed)
+            self.counter_before_loading_weights = _t0
+            self.counter_after_loading_weights = _t0 + _elapsed
+            _exp42_emit("weight_load", mode="ipc", ipc_s=round(_elapsed, 4),
+                        total_s=round(_elapsed, 4))
+            logger.info("IPC import: Loading weights took %.2f seconds", _elapsed)
             return
 
         if model_config.quantization == "torchao":
