@@ -79,6 +79,29 @@ def _exp44_wait_for_gate(mode: str, total_bytes: int):
         time.sleep(0.01)
 
 
+def _exp45_storage_device(param) -> int:
+    """Which device to map the PEER's storage onto: the parameter's OWN device.
+
+    ``_args[6]`` is ``rebuild_cuda_tensor``'s ``storage_device`` (verified against
+    its signature: ..., storage_cls, dtype, storage_device, storage_handle, ...).
+
+    Hardcoding 0 only happens to be right when every process sees a single GPU
+    numbered 0 -- true for the C1 TP=1 layout, and FALSE the moment TP>=2 puts a
+    rank on device 1. There the peer's storage was mapped onto device 0 while the
+    parameter lived on device 1, so the copy crossed devices and fell back to
+    ~34 GB/s (PCIe) instead of the ~740 GB/s same-device path. That is exactly
+    the imbalance measured at TP=2 co-located: rank0 738 GB/s vs rank1 34 GB/s,
+    in every one of five reps.
+
+    For TP=1 this is behaviour-preserving (device index is 0 either way).
+    """
+    try:
+        idx = param.device.index
+        return int(idx) if idx is not None else 0
+    except Exception:
+        return 0
+
+
 def _exp45_tp_rank() -> int:
     """Authoritative TP rank for THIS worker.
 
@@ -499,7 +522,7 @@ class DefaultModelLoader(BaseModelLoader):
                 if _name in _handles:
                     _func, _args = _handles[_name]
                     _args_list = list(_args)
-                    _args_list[6] = 0
+                    _args_list[6] = _exp45_storage_device(_param)
                     _mapped.append((_name, _param, _func(*_args_list)))
                     _ipc_loaded.add(_name)
                 else:
@@ -605,7 +628,7 @@ class DefaultModelLoader(BaseModelLoader):
                 if _name in _handles:
                     _func, _args = _handles[_name]
                     _args_list = list(_args)
-                    _args_list[6] = 0
+                    _args_list[6] = _exp45_storage_device(_param)
                     _ipc_tensors.append((_param, _func(*_args_list)))
 
             _total_bytes = sum(
