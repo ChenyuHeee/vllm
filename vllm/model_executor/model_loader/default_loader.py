@@ -79,6 +79,23 @@ def _exp44_wait_for_gate(mode: str, total_bytes: int):
         time.sleep(0.01)
 
 
+def _exp45_tp_rank() -> int:
+    """Authoritative TP rank for THIS worker.
+
+    Never read os.environ["LOCAL_RANK"] for this: vLLM's multiproc executor
+    passes local_rank to the worker as an ARGUMENT, not reliably as an
+    environment variable. Reading the env returned 0 for every rank, so with
+    TP>=2 all ranks exported to the SAME ``.rank0`` file, only one ``.ready``
+    appeared, and the orchestrator timed out with "source did not emit N .ready
+    in 300s". TP=1 has a single rank, so it masked the bug completely.
+    """
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank as _g
+        return int(_g())
+    except Exception:
+        return int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+
+
 def _exp45_rank_registry(base: str) -> str:
     """exp45: resolve the registry path to the per-rank file.
 
@@ -88,11 +105,7 @@ def _exp45_rank_registry(base: str) -> str:
     """
     if not base:
         return ""
-    try:
-        from vllm.distributed import get_tensor_model_parallel_rank as _g
-        _r = int(_g())
-    except Exception:
-        _r = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+    _r = _exp45_tp_rank()
     _cand = f"{base}.rank{_r}"
     return _cand if _os.path.exists(_cand) else base
 
@@ -642,11 +655,7 @@ class DefaultModelLoader(BaseModelLoader):
             _exp42_emit("weight_load", mode="ipc", ipc_s=round(_elapsed, 4),
                         total_s=round(_elapsed, 4))
             logger.info("IPC import: Loading weights took %.2f seconds", _elapsed)
-            try:
-                from vllm.distributed import get_tensor_model_parallel_rank as _g45
-                _r45 = int(_g45())
-            except Exception:
-                _r45 = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+            _r45 = _exp45_tp_rank()
             logger.info("EXP45_METRIC phase=import tp_rank=%d mode=ipc "
                         "gb=%.3f s=%.4f gbps=%.2f",
                         _r45, _total_gb, _elapsed,
@@ -692,7 +701,7 @@ class DefaultModelLoader(BaseModelLoader):
         # ── IPC export (exp45: all ranks → per-rank file + .ready) ──
         _ipc_export_file = _os.environ.get("VLLM_IPC_EXPORT", "")
         if _ipc_export_file:
-            _tp_rank = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+            _tp_rank = _exp45_tp_rank()
             _ipc_export_rank_file = f"{_ipc_export_file}.rank{_tp_rank}"
             from torch.multiprocessing.reductions import reduce_tensor
             logger.info("IPC export: rank %d exporting handles to %s",
