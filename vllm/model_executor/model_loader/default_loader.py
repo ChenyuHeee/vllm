@@ -50,6 +50,35 @@ def _exp42_emit(phase: str, **kw):
     logger.info("EXP42_JSON %s", _json.dumps({"phase": phase, **kw}))
 
 
+def _exp44_emit(phase: str, **kw):
+    """Emit timestamps that can be aligned across host processes."""
+    logger.info(
+        "EXP44_JSON %s",
+        _json.dumps({
+            "phase": phase,
+            "pid": _os.getpid(),
+            "consumer_id": _os.environ.get("EXP44_CONSUMER_ID", "0"),
+            "wall_ns": time.time_ns(),
+            "mono_ns": time.monotonic_ns(),
+            **kw,
+        }),
+    )
+
+
+def _exp44_wait_for_gate(mode: str, total_bytes: int):
+    gate = _os.environ.get("EXP44_IPC_GATE", "")
+    if not gate:
+        return
+    _exp44_emit("ipc_ready", mode=mode, total_bytes=total_bytes, gate=gate)
+    deadline = time.monotonic() + float(
+        _os.environ.get("EXP44_GATE_TIMEOUT_S", "120")
+    )
+    while not _os.path.exists(gate):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"EXP44 IPC gate timed out: {gate}")
+        time.sleep(0.01)
+
+
 def _layer_idx(name: str) -> int:
     """参数名 -> 层号：embed=-1，*layers.N*=N，其余（norm/lm_head/vision/mtp）= 10**9。
     用 search 而非锚定 match：原始 checkpoint key 是 model.language_model.layers.N.*，
@@ -463,15 +492,50 @@ class DefaultModelLoader(BaseModelLoader):
                 torch.cuda.synchronize()
                 _disk_elapsed["v"] = time.perf_counter() - _t0
 
+            _ipc_bytes = sum(
+                _param.numel() * _param.element_size()
+                for _, _param, _ in _mapped
+            )
+            _exp44_wait_for_gate("hybrid", _ipc_bytes)
+            _t0 = time.perf_counter()
+            _ipc_start_wall_ns = time.time_ns()
+            _ipc_start_mono_ns = time.monotonic_ns()
+            _exp44_emit(
+                "ipc_start",
+                mode="hybrid",
+                total_bytes=_ipc_bytes,
+                start_wall_ns=_ipc_start_wall_ns,
+                start_mono_ns=_ipc_start_mono_ns,
+            )
+
             _thread = _threading.Thread(target=_disk_branch, daemon=True)
             _thread.start()
 
-            _stream_ipc = torch.cuda.Stream()
-            with torch.cuda.stream(_stream_ipc):
-                for _name, _param, _tensor in _mapped:
-                    _param.data.copy_(_tensor)
-                torch.cuda.synchronize()
+            _sham = bool(int(_os.environ.get("EXP44_IPC_SHAM", "0")))
+            if _sham:
+                time.sleep(float(_os.environ.get("EXP44_SHAM_DURATION_S", "0.18")))
+            else:
+                _stream_ipc = torch.cuda.Stream()
+                with torch.cuda.stream(_stream_ipc):
+                    for _name, _param, _tensor in _mapped:
+                        _param.data.copy_(_tensor)
+                    torch.cuda.synchronize()
+            _ipc_end_wall_ns = time.time_ns()
+            _ipc_end_mono_ns = time.monotonic_ns()
             _ipc_elapsed["v"] = time.perf_counter() - _t0
+            _exp44_emit(
+                "ipc_end",
+                mode="hybrid",
+                total_bytes=_ipc_bytes,
+                start_wall_ns=_ipc_start_wall_ns,
+                end_wall_ns=_ipc_end_wall_ns,
+                start_mono_ns=_ipc_start_mono_ns,
+                end_mono_ns=_ipc_end_mono_ns,
+                duration_s=(_ipc_end_mono_ns - _ipc_start_mono_ns) / 1e9,
+                sham=int(_sham),
+            )
+            if _sham or bool(int(_os.environ.get("EXP44_STOP_AFTER_COPY", "0"))):
+                raise RuntimeError("EXP44 copy window complete")
 
             _thread.join()
             _elapsed = time.perf_counter() - _t0
@@ -505,7 +569,6 @@ class DefaultModelLoader(BaseModelLoader):
             logger.info("IPC import: loading weights from peer GPU (registry: %s)", _ipc_import_file)
             with open(_ipc_import_file, "rb") as _f:
                 _handles = _pickle.load(_f)
-            _t0 = time.perf_counter()
             _ipc_tensors = []
             for _name, _param in model.named_parameters():
                 if _name in _handles:
@@ -513,11 +576,48 @@ class DefaultModelLoader(BaseModelLoader):
                     _args_list = list(_args)
                     _args_list[6] = 0
                     _ipc_tensors.append((_param, _func(*_args_list)))
-            for _param, _tensor in _ipc_tensors:
-                _param.data.copy_(_tensor)
-            torch.cuda.synchronize()
+
+            _total_bytes = sum(
+                _param.numel() * _param.element_size()
+                for _param, _ in _ipc_tensors
+            )
+            _exp44_wait_for_gate("ipc", _total_bytes)
+            _sham = bool(int(_os.environ.get("EXP44_IPC_SHAM", "0")))
+            _t0 = time.perf_counter()
+            _ipc_start_wall_ns = time.time_ns()
+            _ipc_start_mono_ns = time.monotonic_ns()
+            _exp44_emit(
+                "ipc_start",
+                mode="ipc",
+                total_bytes=_total_bytes,
+                start_wall_ns=_ipc_start_wall_ns,
+                start_mono_ns=_ipc_start_mono_ns,
+                sham=int(_sham),
+            )
+            if _sham:
+                time.sleep(float(_os.environ.get("EXP44_SHAM_DURATION_S", "0.27")))
+            else:
+                for _param, _tensor in _ipc_tensors:
+                    _param.data.copy_(_tensor)
+                torch.cuda.synchronize()
+            _ipc_end_wall_ns = time.time_ns()
+            _ipc_end_mono_ns = time.monotonic_ns()
             _elapsed = time.perf_counter() - _t0
-            _total_gb = sum(p.numel() * p.element_size() for _, p in model.named_parameters()) / 1e9
+            _exp44_emit(
+                "ipc_end",
+                mode="ipc",
+                total_bytes=_total_bytes,
+                start_wall_ns=_ipc_start_wall_ns,
+                end_wall_ns=_ipc_end_wall_ns,
+                start_mono_ns=_ipc_start_mono_ns,
+                end_mono_ns=_ipc_end_mono_ns,
+                duration_s=(_ipc_end_mono_ns - _ipc_start_mono_ns) / 1e9,
+                sham=int(_sham),
+            )
+            if _sham or bool(int(_os.environ.get("EXP44_STOP_AFTER_COPY", "0"))):
+                raise RuntimeError("EXP44 copy window complete")
+
+            _total_gb = _total_bytes / 1e9
             logger.info("IPC import: %.1f GB in %.2f seconds (%.1f GB/s)", _total_gb, _elapsed, _total_gb / _elapsed)
             self.counter_before_loading_weights = _t0
             self.counter_after_loading_weights = _t0 + _elapsed
