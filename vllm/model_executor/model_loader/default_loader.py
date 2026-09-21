@@ -79,6 +79,24 @@ def _exp44_wait_for_gate(mode: str, total_bytes: int):
         time.sleep(0.01)
 
 
+def _exp45_rank_registry(base: str) -> str:
+    """exp45: resolve the registry path to the per-rank file.
+
+    Each source rank exports to ``${VLLM_IPC_EXPORT}.rank{i}``; the matching
+    target rank reads ``.rank{i}``. Falls back to ``base`` when the per-rank
+    file is absent, so exp44-style single-file runs keep working.
+    """
+    if not base:
+        return ""
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank as _g
+        _r = int(_g())
+    except Exception:
+        _r = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+    _cand = f"{base}.rank{_r}"
+    return _cand if _os.path.exists(_cand) else base
+
+
 def _layer_idx(name: str) -> int:
     """参数名 -> 层号：embed=-1，*layers.N*=N，其余（norm/lm_head/vision/mtp）= 10**9。
     用 search 而非锚定 match：原始 checkpoint key 是 model.language_model.layers.N.*，
@@ -563,8 +581,8 @@ class DefaultModelLoader(BaseModelLoader):
             logger.info("Hybrid import: total %.2f s (ipc %.2f s / disk %.2f s)",
                         _elapsed, _ipc_elapsed["v"], _disk_elapsed["v"])
             return
-        # ── IPC direct import path ──
-        _ipc_import_file = _os.environ.get("VLLM_IPC_REGISTRY", "")
+        # ── IPC direct import path (exp45: per-rank registry) ──
+        _ipc_import_file = _exp45_rank_registry(_os.environ.get("VLLM_IPC_REGISTRY", ""))
         if _ipc_import_file and _os.path.exists(_ipc_import_file):
             logger.info("IPC import: loading weights from peer GPU (registry: %s)", _ipc_import_file)
             with open(_ipc_import_file, "rb") as _f:
@@ -624,6 +642,14 @@ class DefaultModelLoader(BaseModelLoader):
             _exp42_emit("weight_load", mode="ipc", ipc_s=round(_elapsed, 4),
                         total_s=round(_elapsed, 4))
             logger.info("IPC import: Loading weights took %.2f seconds", _elapsed)
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank as _g45
+                _r45 = int(_g45())
+            except Exception:
+                _r45 = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
+            logger.info("EXP45_METRIC tp_rank=%d mode=ipc gb=%.3f s=%.4f gbps=%.2f",
+                        _r45, _total_gb, _elapsed,
+                        (_total_gb / _elapsed) if _elapsed > 0 else 0.0)
             return
 
         if model_config.quantization == "torchao":
@@ -662,19 +688,28 @@ class DefaultModelLoader(BaseModelLoader):
                     f"checkpoint: {weights_not_loaded}"
                 )
 
-        # ── IPC export (rank 0 only) ──
+        # ── IPC export (exp45: all ranks → per-rank file + .ready) ──
         _ipc_export_file = _os.environ.get("VLLM_IPC_EXPORT", "")
         if _ipc_export_file:
             _tp_rank = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
-            if _tp_rank == 0 or _os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0] == _os.environ.get("VLLM_IPC_EXPORT_RANK0_DEVICE", "0"):
-                from torch.multiprocessing.reductions import reduce_tensor
-                logger.info("IPC export: exporting handles to %s", _ipc_export_file)
-                _t0 = time.perf_counter()
-                _handles = {}
-                for _name, _param in model.named_parameters():
-                    _handles[_name] = reduce_tensor(_param.data)
-                torch.cuda.synchronize()
-                with open(_ipc_export_file, "wb") as _f:
-                    _pickle.dump(_handles, _f)
-                _elapsed = time.perf_counter() - _t0
-                logger.info("IPC export: %d parameters in %.2f seconds", len(_handles), _elapsed)
+            _ipc_export_rank_file = f"{_ipc_export_file}.rank{_tp_rank}"
+            from torch.multiprocessing.reductions import reduce_tensor
+            logger.info("IPC export: rank %d exporting handles to %s",
+                        _tp_rank, _ipc_export_rank_file)
+            _t0 = time.perf_counter()
+            _handles = {}
+            for _name, _param in model.named_parameters():
+                _handles[_name] = reduce_tensor(_param.data)
+            torch.cuda.synchronize()
+            with open(_ipc_export_rank_file, "wb") as _f:
+                _pickle.dump(_handles, _f)
+            _elapsed = time.perf_counter() - _t0
+            _gb = sum(p.numel() * p.element_size()
+                      for _, p in model.named_parameters()) / 1e9
+            logger.info("IPC export: rank %d, %d parameters in %.2f seconds",
+                        _tp_rank, len(_handles), _elapsed)
+            logger.info("EXP45_METRIC tp_rank=%d mode=export gb=%.3f s=%.4f gbps=%.2f",
+                        _tp_rank, _gb, _elapsed,
+                        (_gb / _elapsed) if _elapsed > 0 else 0.0)
+            with open(_ipc_export_rank_file + ".ready", "w") as _f:
+                _f.write("1\n")
