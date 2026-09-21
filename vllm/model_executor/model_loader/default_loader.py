@@ -647,7 +647,8 @@ class DefaultModelLoader(BaseModelLoader):
                 _r45 = int(_g45())
             except Exception:
                 _r45 = int(_os.environ.get("LOCAL_RANK", _os.environ.get("RANK", "0")))
-            logger.info("EXP45_METRIC tp_rank=%d mode=ipc gb=%.3f s=%.4f gbps=%.2f",
+            logger.info("EXP45_METRIC phase=import tp_rank=%d mode=ipc "
+                        "gb=%.3f s=%.4f gbps=%.2f",
                         _r45, _total_gb, _elapsed,
                         (_total_gb / _elapsed) if _elapsed > 0 else 0.0)
             return
@@ -708,8 +709,9 @@ class DefaultModelLoader(BaseModelLoader):
                       for _, p in model.named_parameters()) / 1e9
             logger.info("IPC export: rank %d, %d parameters in %.2f seconds",
                         _tp_rank, len(_handles), _elapsed)
-            logger.info("EXP45_METRIC tp_rank=%d mode=export gb=%.3f s=%.4f gbps=%.2f",
-                        _tp_rank, _gb, _elapsed,
+            logger.info("EXP45_METRIC phase=export tp_rank=%d mode=ipc "
+                        "n_params=%d gb=%.3f s=%.4f gbps=%.2f",
+                        _tp_rank, len(_handles), _gb, _elapsed,
                         (_gb / _elapsed) if _elapsed > 0 else 0.0)
             with open(_ipc_export_rank_file + ".ready", "w") as _f:
                 _f.write("1\n")
